@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -25,6 +26,8 @@ type UnionPay struct {
 	PfxPath   string
 	PfxPwd    string
 	UnionCert UnionCert
+	apiurl    string
+	apiaddr   string
 }
 
 // UnionCert cert info
@@ -38,16 +41,28 @@ type UnionCert struct {
 func NewUnionPay(unionPay UnionPay) *UnionPay {
 	if err := unionPay.checkConfig(); err != nil {
 		log.Fatalf("New UnionPay client error: %v", err)
-		return nil
 	}
 	return &unionPay
 }
 
 // Post requset
-func (c *UnionPay) Post(url string, m map[string]string) (map[string]string, error) {
-	log.Println("sign: ", m["signature"])
-	client := http.Client{}
-	resp, err := client.Post(url, "application/x-www-form-urlencoded;charset=utf-8", strings.NewReader(MapURLEncode(m)))
+func (c *UnionPay) Post(m map[string]string) (map[string]string, error) {
+	contentType := "application/x-www-form-urlencoded;charset=utf-8"
+	client := http.Client{
+		Transport: &http.Transport{
+			Dial: func(netw, addr string) (net.Conn, error) {
+				c, err := net.DialTimeout(netw, addr, time.Second*5)
+				if err != nil {
+					log.Println("dail timeout", err)
+					return nil, err
+				}
+				return c, nil
+			},
+			MaxIdleConnsPerHost:   10,
+			ResponseHeaderTimeout: time.Second * 3,
+		},
+	}
+	resp, err := client.Post(c.apiurl, contentType, strings.NewReader(MapURLEncode(m)))
 	if err != nil {
 		return nil, err
 	}
@@ -95,24 +110,35 @@ func (c *UnionPay) checkConfig() (err error) {
 }
 
 // public params
-func (c *UnionPay) publicParams() map[string]string {
-	m := make(map[string]string, 0)
+func (c *UnionPay) publicParams(m map[string]string) map[string]string {
 	m["version"] = "5.1.0"
 	m["encoding"] = "utf-8"
 	m["signMethod"] = "01"
 
 	m["certId"] = c.UnionCert.CertID
 	m["merId"] = c.MerID
-	if c.FrontURL != "" {
+	if c.FrontURL != "" && m["frontUrl"] != "0" {
 		m["frontUrl"] = c.FrontURL
 	}
-	m["backUrl"] = c.BackURL
-
-	if c.Mode == "dev" {
-		c.URL = "https://gateway.test.95516.com"
-	} else if c.Mode == "prod" {
-		c.URL = "https://gateway.95516.com"
+	if m["backUrl"] != "0" {
+		m["backUrl"] = c.BackURL
 	}
+
+	switch c.Mode {
+	case "prod":
+		c.URL = "https://gateway.95516.com"
+	case "dev":
+		c.URL = "https://gateway.test.95516.com"
+	}
+	c.apiurl = c.URL + c.apiaddr
+
+	m["txnTime"] = time.Now().Format("20060102150405")
+	sign, err := Sign(m, c.UnionCert.Private)
+	if err != nil {
+		log.Fatalf("UnionPay sign with privateKey error: %v", err)
+	}
+	m["signature"] = sign
+	log.Println("UnionPay sign: ", sign)
 	return m
 }
 
@@ -176,7 +202,8 @@ func MapURLEncode(m map[string]string) string {
 
 // AppConsume 消费获取Tn
 func (c *UnionPay) AppConsume(txnamt int, orderNo, attach string) (map[string]string, error) {
-	m := c.publicParams()
+	c.apiaddr = "/gateway/api/appTransReq.do"
+	m := make(map[string]string, 0)
 	m["txnType"] = "01"
 	m["txnSubType"] = "01"
 	m["bizType"] = "000201"
@@ -185,19 +212,17 @@ func (c *UnionPay) AppConsume(txnamt int, orderNo, attach string) (map[string]st
 	m["currencyCode"] = "156"
 
 	m["orderId"] = orderNo
-	m["txnTime"] = time.Now().Format("20060102150405")
 	m["txnAmt"] = fmt.Sprintf("%d", txnamt)
 	if attach != "" {
 		m["reqReserved"] = base64.StdEncoding.EncodeToString([]byte(attach))
 	}
-	m["signature"], _ = Sign(m, c.UnionCert.Private)
-	return c.Post(c.URL+"/gateway/api/appTransReq.do", m)
+	return c.Post(c.publicParams(m))
 }
 
 // ConsumeUndo 消费撤销交易
 func (c *UnionPay) ConsumeUndo(txnamt int, orderNo, queryID, attach string) (map[string]string, error) {
-	m := c.publicParams()
-	delete(m, "frontUrl")
+	c.apiaddr = "/gateway/api/backTransReq.do"
+	m := make(map[string]string, 0)
 	m["txnType"] = "31"
 	m["txnSubType"] = "00"
 	m["bizType"] = "000201"
@@ -206,19 +231,18 @@ func (c *UnionPay) ConsumeUndo(txnamt int, orderNo, queryID, attach string) (map
 
 	m["orderId"] = orderNo
 	m["origQryId"] = queryID
-	m["txnTime"] = time.Now().Format("20060102150405")
 	m["txnAmt"] = fmt.Sprintf("%d", txnamt)
 	if attach != "" {
 		m["reqReserved"] = base64.StdEncoding.EncodeToString([]byte(attach))
 	}
-	m["signature"], _ = Sign(m, c.UnionCert.Private)
-	return c.Post(c.URL+"/gateway/api/backTransReq.do", m)
+	m["frontUrl"] = "0"
+	return c.Post(c.publicParams(m))
 }
 
 // Refund 退货交易
 func (c *UnionPay) Refund(txnamt int, orderNo, queryID, attach string) (map[string]string, error) {
-	m := c.publicParams()
-	delete(m, "frontUrl")
+	c.apiaddr = "/gateway/api/backTransReq.do"
+	m := make(map[string]string, 0)
 	m["txnType"] = "04"
 	m["txnSubType"] = "00"
 	m["bizType"] = "000201"
@@ -227,20 +251,18 @@ func (c *UnionPay) Refund(txnamt int, orderNo, queryID, attach string) (map[stri
 
 	m["orderId"] = orderNo
 	m["origQryId"] = queryID
-	m["txnTime"] = time.Now().Format("20060102150405")
 	m["txnAmt"] = fmt.Sprintf("%d", txnamt)
 	if attach != "" {
 		m["reqReserved"] = base64.StdEncoding.EncodeToString([]byte(attach))
 	}
-	m["signature"], _ = Sign(m, c.UnionCert.Private)
-	return c.Post(c.URL+"/gateway/api/backTransReq.do", m)
+	m["frontUrl"] = "0"
+	return c.Post(c.publicParams(m))
 }
 
 // Query 交易状态查询
 func (c *UnionPay) Query(orderNo string) (map[string]string, error) {
-	m := c.publicParams()
-	delete(m, "frontUrl")
-	delete(m, "backUrl")
+	c.apiaddr = "/gateway/api/queryTrans.do"
+	m := make(map[string]string, 0)
 	m["txnType"] = "00"
 	m["txnSubType"] = "00"
 	m["bizType"] = "000000"
@@ -248,7 +270,7 @@ func (c *UnionPay) Query(orderNo string) (map[string]string, error) {
 	m["accessType"] = "0"
 
 	m["orderId"] = orderNo
-	m["txnTime"] = time.Now().Format("20060102150405")
-	m["signature"], _ = Sign(m, c.UnionCert.Private)
-	return c.Post(c.URL+"/gateway/api/queryTrans.do", m)
+	m["frontUrl"] = "0"
+	m["backUrl"] = "0"
+	return c.Post(c.publicParams(m))
 }
