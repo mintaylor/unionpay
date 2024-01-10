@@ -10,91 +10,86 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 
 	"software.sslmate.com/src/go-pkcs12"
 )
 
-// Sign sign with privateKey.
-func Sign(params map[string]string, private *rsa.PrivateKey) (string, error) {
-	str := SortUnionMap(params)
-	hashed := sha256.Sum256([]byte(fmt.Sprintf("%x", sha256.Sum256([]byte(str)))))
-	sign, err := rsa.SignPKCS1v15(rand.Reader, private, crypto.SHA256, hashed[:])
+// hashMessage hash message twice.
+func hashMessage(m map[string]string) []byte {
+	str := SortUnionMap(m)
+	firstHash := sha256.Sum256([]byte(str))
+	secondHash := sha256.Sum256([]byte(fmt.Sprintf("%x", firstHash)))
+	return secondHash[:]
+}
+
+// SignMapWithPrivate sign with privateKey.
+func SignMapWithPrivate(m map[string]string, private *rsa.PrivateKey) (string, error) {
+	hashed := hashMessage(m)
+	sign, err := rsa.SignPKCS1v15(rand.Reader, private, crypto.SHA256, hashed)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("error signing data: %v", err)
 	}
 	return base64.StdEncoding.EncodeToString(sign), nil
 }
 
 // SignVerify verify the signature.
-func SignVerify(params map[string]string) (bool, error) {
-	sign := params["signature"]
-	str := SortUnionMap(params)
-	hashed := sha256.Sum256([]byte(fmt.Sprintf("%x", sha256.Sum256([]byte(str)))))
+func SignVerify(m map[string]string) error {
+	sign, ok := m["signature"]
+	if !ok {
+		return errors.New("signature not found in params")
+	}
+
+	signPubKeyCert, ok := m["signPubKeyCert"]
+	if !ok {
+		return errors.New("signPubKeyCert not found in params")
+	}
+
+	hashed := hashMessage(m)
+
 	signBytes, err := base64.StdEncoding.DecodeString(sign)
 	if err != nil {
-		return false, fmt.Errorf("signature base64 decode error: %v", err)
+		return fmt.Errorf("error decoding signature: %v", err)
 	}
 
-	block, _ := pem.Decode([]byte(params["signPubKeyCert"]))
+	block, _ := pem.Decode([]byte(signPubKeyCert))
 	if block == nil {
-		return false, errors.New("public key error")
+		return errors.New("error decoding public key certificate")
 	}
 
-	pubilcCert, err := x509.ParseCertificate(block.Bytes)
+	publicCert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return false, err
+		return fmt.Errorf("error parsing certificate: %v", err)
 	}
 
-	err = rsa.VerifyPKCS1v15(pubilcCert.PublicKey.(*rsa.PublicKey), crypto.SHA256, hashed[:], signBytes)
-	if err != nil {
-		return false, fmt.Errorf("sign verify failed: %v", err)
+	publicKey, ok := publicCert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return errors.New("error asserting type: publicKey is not of type *rsa.PublicKey")
 	}
-	return true, nil
+
+	if err := rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, hashed, signBytes); err != nil {
+		return fmt.Errorf("signature verification failed: %v", err)
+	}
+
+	return nil
 }
 
-// ParserPfxToCert 根据银联获取到的PFX文件和密码来解析出里面包含的私钥(rsa)和证书(x509)
-func ParserPfxToCert(path string, password string) (private *rsa.PrivateKey, cert *x509.Certificate, err error) {
-	var pfxData []byte
-	pfxData, err = ioutil.ReadFile(path)
+// ParserPfxToCert parse pfx file to private key and certificate.
+func ParserPfxToCert(path string, password string) (*rsa.PrivateKey, *x509.Certificate, error) {
+	pfxData, err := os.ReadFile(path)
 	if err != nil {
-		return
+		return nil, nil, fmt.Errorf("unable to read pfx file: %v", err)
 	}
 
 	priv, cert, _, err := pkcs12.DecodeChain(pfxData, password)
 	if err != nil {
-		return
+		return nil, nil, fmt.Errorf("error decoding pfx data: %v", err)
 	}
 
-	private = priv.(*rsa.PrivateKey)
-	return
-}
-
-// ParseCertificateFromFile 根据文件名解析出证书
-// openssl pkcs12 -in xxxx.pfx -clcerts -nokeys -out key.cert
-func ParseCertificateFromFile(path string) (cert *x509.Certificate, err error) {
-	// Read the verify sign certification key
-	pemData, err := ioutil.ReadFile(path)
-	if err != nil {
-		return
+	private, ok := priv.(*rsa.PrivateKey)
+	if !ok {
+		return nil, nil, errors.New("decoded key is not RSA private key")
 	}
 
-	// Extract the PEM-encoded data block
-	block, _ := pem.Decode(pemData)
-	if block == nil {
-		err = fmt.Errorf("bad key data: %s", "not PEM-encoded")
-		return
-	}
-	if got, want := block.Type, "CERTIFICATE"; got != want {
-		err = fmt.Errorf("unknown key type %q, want %q", got, want)
-		return
-	}
-
-	// Decode the certification
-	cert, err = x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		err = fmt.Errorf("bad private key: %s", err)
-		return
-	}
-	return
+	return private, cert, nil
 }
